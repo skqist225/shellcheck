@@ -34,6 +34,8 @@ import qualified ShellCheck.Formatter.Quiet
 
 import           Control.Exception
 import           Control.Monad
+import           Control.Monad.IO.Class
+import           Control.Monad.Trans.Class
 import           Control.Monad.Except
 import           Data.Bits
 import           Data.Char
@@ -394,7 +396,7 @@ ioInterface options files = do
     inputs <- mapM normalize files
     cache <- newIORef emptyCache
     configCache <- newIORef ("", Nothing)
-    return SystemInterface {
+    return (newSystemInterface :: SystemInterface IO) {
         siReadFile = get cache inputs,
         siFindSource = findSourceFile inputs (sourcePaths options),
         siGetConfig = getConfig configCache

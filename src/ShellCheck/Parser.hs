@@ -1,5 +1,5 @@
 {-
-    Copyright 2012-2021 Vidar Holen
+    Copyright 2012-2022 Vidar Holen
 
     This file is part of ShellCheck.
     https://www.shellcheck.net
@@ -2112,6 +2112,7 @@ prop_readSimpleCommand11 = isOk readSimpleCommand "/\\* foo"
 prop_readSimpleCommand12 = isWarning readSimpleCommand "elsif foo"
 prop_readSimpleCommand13 = isWarning readSimpleCommand "ElseIf foo"
 prop_readSimpleCommand14 = isWarning readSimpleCommand "elseif[$i==2]"
+prop_readSimpleCommand15 = isWarning readSimpleCommand "trap 'foo\"bar' INT"
 readSimpleCommand = called "simple command" $ do
     prefix <- option [] readCmdPrefix
     skipAnnotationAndWarn
@@ -2141,9 +2142,12 @@ readSimpleCommand = called "simple command" $ do
             id2 <- getNewIdFor id1
 
             let result = makeSimpleCommand id1 id2 prefix [cmd] suffix
-            if isCommand ["source", "."] cmd
-                then readSource result
-                else return result
+            case () of
+                _ | isCommand ["source", "."] cmd -> readSource result
+                _ | isCommand ["trap"] cmd -> do
+                        syntaxCheckTrap result
+                        return result
+                _ -> return result
   where
     isCommand strings (T_NormalWord _ [T_Literal _ s]) = s `elem` strings
     isCommand _ _ = False
@@ -2162,6 +2166,17 @@ readSimpleCommand = called "simple command" $ do
                 when (cmdString `elem` ["elsif", "elseif"]) $
                     parseProblemAtId (getId cmd) ErrorC 1131 "Use 'elif' to start another branch."
             _ -> return ()
+
+    syntaxCheckTrap cmd =
+        case cmd of
+            (T_Redirecting _ _ (T_SimpleCommand _ _ (cmd:arg:_))) -> checkArg arg (getLiteralString arg)
+            _ -> return ()
+      where
+        checkArg _ Nothing = return ()
+        checkArg arg (Just ('-':_)) = return ()
+        checkArg arg (Just str) = do
+            (start,end) <- getSpanForId (getId arg)
+            subParse start (tryWithErrors (readCompoundListOrEmpty >> verifyEof) <|> return ()) str
 
     commentWarning id =
         parseProblemAtId id ErrorC 1127 "Was this intended as a comment? Use # in sh."
@@ -2268,22 +2283,31 @@ readSource t@(T_Redirecting _ _ (T_SimpleCommand cmdId _ (cmd:file':rest'))) = d
 
     subRead name script =
         withContext (ContextSource name) $
-            inSeparateContext $
-                subParse (initialPos name) (readScriptFile True) script
+            inSeparateContext $ do
+                oldState <- getState
+                setState $ oldState { pendingHereDocs = [] }
+                result <- subParse (initialPos name) (readScriptFile True) script
+                newState <- getState
+                setState $ newState { pendingHereDocs = pendingHereDocs oldState }
+                return result
 readSource t = return t
 
 
 prop_readPipeline = isOk readPipeline "! cat /etc/issue | grep -i ubuntu"
 prop_readPipeline2 = isWarning readPipeline "!cat /etc/issue | grep -i ubuntu"
 prop_readPipeline3 = isOk readPipeline "for f; do :; done|cat"
+prop_readPipeline4 = isOk readPipeline "! ! true"
+prop_readPipeline5 = isOk readPipeline "true | ! true"
 readPipeline = do
     unexpecting "keyword/token" readKeyword
-    do
-        (T_Bang id) <- g_Bang
-        pipe <- readPipeSequence
-        return $ T_Banged id pipe
-      <|>
-        readPipeSequence
+    readBanged readPipeSequence
+
+readBanged parser = do
+    pos <- getPosition
+    (T_Bang id) <- g_Bang
+    next <- readBanged parser
+    return $ T_Banged id next
+ <|> parser
 
 prop_readAndOr = isOk readAndOr "grep -i lol foo || exit 1"
 prop_readAndOr1 = isOk readAndOr "# shellcheck disable=1\nfoo"
@@ -2339,7 +2363,7 @@ readTerm = do
 
 readPipeSequence = do
     start <- startSpan
-    (cmds, pipes) <- sepBy1WithSeparators readCommand
+    (cmds, pipes) <- sepBy1WithSeparators (readBanged readCommand)
                         (readPipe `thenSkip` (spacing >> readLineBreak))
     id <- endSpan start
     spacing
@@ -2369,6 +2393,10 @@ readCommand = choice [
     ]
 
 readCmdName = do
+    -- If the command name is `!` then
+    optional . lookAhead . try $ do
+        char '!'
+        whitespace
     -- Ignore alias suppression
     optional . try $ do
         char '\\'
@@ -2500,16 +2528,29 @@ readBraceGroup = called "brace group" $ do
     spacing
     return $ T_BraceGroup id list
 
-prop_readBatsTest = isOk readBatsTest "@test 'can parse' {\n  true\n}"
+prop_readBatsTest1 = isOk readBatsTest "@test 'can parse' {\n  true\n}"
+prop_readBatsTest2 = isOk readBatsTest "@test random text !(@*$Y&! {\n  true\n}"
+prop_readBatsTest3 = isOk readBatsTest "@test foo { bar { baz {\n  true\n}"
+prop_readBatsTest4 = isNotOk readBatsTest "@test foo \n{\n true\n}"
 readBatsTest = called "bats @test" $ do
     start <- startSpan
-    try $ string "@test"
+    try $ string "@test "
     spacing
-    name <- readNormalWord
+    name <- readBatsName
     spacing
     test <- readBraceGroup
     id <- endSpan start
     return $ T_BatsTest id name test
+  where
+    readBatsName = do
+        line <- try . lookAhead $ many1 $ noneOf "\n"
+        let name = reverse $ f $ reverse line
+        string name
+
+    -- We want everything before the last " {" in a string, so we find everything after "{ " in its reverse
+    f ('{':' ':rest) = dropWhile isSpace rest
+    f (a:rest) = f rest
+    f [] = ""
 
 prop_readWhileClause = isOk readWhileClause "while [[ -e foo ]]; do sleep 1; done"
 readWhileClause = called "while loop" $ do
@@ -2538,7 +2579,7 @@ readDoGroup kwId = do
         parseProblem ErrorC 1058 "Expected 'do'."
         return "Expected 'do'"
 
-    acceptButWarn g_Semi ErrorC 1059 "No semicolons directly after 'do'."
+    acceptButWarn g_Semi ErrorC 1059 "Semicolon is not allowed directly after 'do'. You can just delete it."
     allspacing
 
     optional (do
@@ -3294,6 +3335,7 @@ readScriptFile sourced = do
               then do
                     commands <- readCompoundListOrEmpty
                     id <- endSpan start
+                    readPendingHereDocs
                     verifyEof
                     let script = T_Annotation annotationId annotations $
                                     T_Script id shebang commands
@@ -3332,6 +3374,7 @@ readScriptFile sourced = do
         "awk",
         "csh",
         "expect",
+        "fish",
         "perl",
         "python",
         "ruby",

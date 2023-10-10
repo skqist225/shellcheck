@@ -1,5 +1,5 @@
 {-
-    Copyright 2012-2021 Vidar Holen
+    Copyright 2012-2022 Vidar Holen
 
     This file is part of ShellCheck.
     https://www.shellcheck.net
@@ -201,6 +201,7 @@ nodeChecks = [
     ,checkOverwrittenExitCode
     ,checkUnnecessaryArithmeticExpansionIndex
     ,checkUnnecessaryParens
+    ,checkPlusEqualsNumber
     ]
 
 optionalChecks = map fst optionalTreeChecks
@@ -550,6 +551,7 @@ prop_checkPipePitfalls19 = verifyNot checkPipePitfalls "foo | grep -A2 bar | wc 
 prop_checkPipePitfalls20 = verifyNot checkPipePitfalls "foo | grep -B999 bar | wc -l"
 prop_checkPipePitfalls21 = verifyNot checkPipePitfalls "foo | grep --after-context 999 bar | wc -l"
 prop_checkPipePitfalls22 = verifyNot checkPipePitfalls "foo | grep -B 1 --after-context 999 bar | wc -l"
+prop_checkPipePitfalls23 = verifyNot checkPipePitfalls "ps -o pid,args -p $(pgrep java) | grep -F net.shellcheck.Test"
 checkPipePitfalls _ (T_Pipeline id _ commands) = do
     for ["find", "xargs"] $
         \(find:xargs:_) ->
@@ -561,10 +563,17 @@ checkPipePitfalls _ (T_Pipeline id _ commands) = do
                 hasParameter "print0",
                 hasParameter "printf"
               ]) $ warn (getId find) 2038
-                      "Use -print0/-0 or -exec + to allow for non-alphanumeric filenames."
+                      "Use 'find .. -print0 | xargs -0 ..' or 'find .. -exec .. +' to allow non-alphanumeric filenames."
 
-    for' ["ps", "grep"] $
-        \x -> info x 2009 "Consider using pgrep instead of grepping ps output."
+    for ["ps", "grep"] $
+        \(ps:grep:_) ->
+            let
+                psFlags = maybe [] (map snd . getAllFlags) $ getCommand ps
+            in
+                -- There are many ways to specify a pid: 1, -1, p 1, wup 1, -q 1, -p 1, --pid 1.
+                -- For simplicity we only deal with the most canonical looking flags:
+                unless (any (`elem` ["p", "pid", "q", "quick-pid"]) psFlags) $
+                    info (getId ps) 2009 "Consider using pgrep instead of grepping ps output."
 
     for ["grep", "wc"] $
         \(grep:wc:_) ->
@@ -782,6 +791,7 @@ prop_checkUnquotedExpansions7 = verifyNot checkUnquotedExpansions "cat << foo\n$
 prop_checkUnquotedExpansions8 = verifyNot checkUnquotedExpansions "set -- $(seq 1 4)"
 prop_checkUnquotedExpansions9 = verifyNot checkUnquotedExpansions "echo foo `# inline comment`"
 prop_checkUnquotedExpansions10 = verify checkUnquotedExpansions "#!/bin/sh\nexport var=$(val)"
+prop_checkUnquotedExpansions11 = verifyNot checkUnquotedExpansions "ps -p $(pgrep foo)"
 checkUnquotedExpansions params =
     check
   where
@@ -795,7 +805,7 @@ checkUnquotedExpansions params =
             warn (getId t) 2046 "Quote this to prevent word splitting."
 
     shouldBeSplit t =
-        getCommandNameFromExpansion t == Just "seq"
+        getCommandNameFromExpansion t `elem` [Just "seq", Just "pgrep"]
 
 
 prop_checkRedirectToSame = verify checkRedirectToSame "cat foo > foo"
@@ -807,6 +817,7 @@ prop_checkRedirectToSame6 = verifyNot checkRedirectToSame "echo foo > foo"
 prop_checkRedirectToSame7 = verifyNot checkRedirectToSame "sed 's/foo/bar/g' file | sponge file"
 prop_checkRedirectToSame8 = verifyNot checkRedirectToSame "while read -r line; do _=\"$fname\"; done <\"$fname\""
 prop_checkRedirectToSame9 = verifyNot checkRedirectToSame "while read -r line; do cat < \"$fname\"; done <\"$fname\""
+prop_checkRedirectToSame10 = verifyNot checkRedirectToSame "mapfile -t foo <foo"
 checkRedirectToSame params s@(T_Pipeline _ _ list) =
     mapM_ (\l -> (mapM_ (\x -> doAnalysis (checkOccurrences x) l) (getAllRedirs list))) list
   where
@@ -852,7 +863,7 @@ checkRedirectToSame params s@(T_Pipeline _ _ list) =
     isHarmlessCommand arg = fromMaybe False $ do
         cmd <- getClosestCommand (parentMap params) arg
         name <- getCommandBasename cmd
-        return $ name `elem` ["echo", "printf", "sponge"]
+        return $ name `elem` ["echo", "mapfile", "printf", "sponge"]
     containsAssignment arg = fromMaybe False $ do
         cmd <- getClosestCommand (parentMap params) arg
         return $ isAssignment cmd
@@ -1875,6 +1886,7 @@ prop_checkSpuriousExec7 = verifyNot checkSpuriousExec "exec file; echo failed; e
 prop_checkSpuriousExec8 = verifyNot checkSpuriousExec "exec {origout}>&1- >tmp.log 2>&1; bar"
 prop_checkSpuriousExec9 = verify checkSpuriousExec "for file in rc.d/*; do exec \"$file\"; done"
 prop_checkSpuriousExec10 = verifyNot checkSpuriousExec "exec file; r=$?; printf >&2 'failed\n'; return $r"
+prop_checkSpuriousExec11 = verifyNot checkSpuriousExec "exec file; :"
 checkSpuriousExec _ = doLists
   where
     doLists (T_Script _ _ cmds) = doList cmds False
@@ -1890,7 +1902,7 @@ checkSpuriousExec _ = doLists
 
     stripCleanup = reverse . dropWhile cleanup . reverse
     cleanup (T_Pipeline _ _ [cmd]) =
-        isCommandMatch cmd (`elem` ["echo", "exit", "printf", "return"])
+        isCommandMatch cmd (`elem` [":", "echo", "exit", "printf", "return"])
         || isAssignment cmd
     cleanup _ = False
 
@@ -2099,6 +2111,8 @@ prop_checkSpacefulnessCfg61 = verify checkSpacefulnessCfg "declare -x X; y=foo$X
 prop_checkSpacefulnessCfg62 = verifyNot checkSpacefulnessCfg "f() { declare -x X; y=foo$X; echo $y; }"
 prop_checkSpacefulnessCfg63 = verify checkSpacefulnessCfg "f && declare -i s; s='x + y'; echo $s"
 prop_checkSpacefulnessCfg64 = verifyNot checkSpacefulnessCfg "declare -i s; s='x + y'; x=$s; echo $x"
+prop_checkSpacefulnessCfg65 = verifyNot checkSpacefulnessCfg "f() { s=$?; echo $s; }; f"
+prop_checkSpacefulnessCfg66 = verifyNot checkSpacefulnessCfg "f() { s=$?; echo $s; }"
 
 checkSpacefulnessCfg = checkSpacefulnessCfg' True
 checkVerboseSpacefulnessCfg = checkSpacefulnessCfg' False
@@ -2121,7 +2135,8 @@ checkSpacefulnessCfg' dirtyPass params token@(T_DollarBraced id _ list) =
                     addDoubleQuotesAround params token
 
   where
-    name = getBracedReference $ concat $ oversimplify list
+    bracedString = concat $ oversimplify list
+    name = getBracedReference bracedString
     parents = parentMap params
     needsQuoting =
               not (isArrayExpansion token) -- There's another warning for this
@@ -2140,13 +2155,9 @@ checkSpacefulnessCfg' dirtyPass params token@(T_DollarBraced id _ list) =
         || CF.spaceStatus (CF.variableValue state) == CF.SpaceStatusClean
 
     isDefaultAssignment parents token =
-        let modifier = getBracedModifier $ bracedString token in
+        let modifier = getBracedModifier bracedString in
             any (`isPrefixOf` modifier) ["=", ":="]
             && isParamTo parents ":" token
-
-    -- Given a T_DollarBraced, return a simplified version of the string contents.
-    bracedString (T_DollarBraced _ _ l) = concat $ oversimplify l
-    bracedString _ = error $ pleaseReport "bracedString on non-variable"
 
 checkSpacefulnessCfg' _ _ _ = return ()
 
@@ -3572,7 +3583,6 @@ prop_checkPipeToNowhere4 = verify checkPipeToNowhere "printf 'Lol' << eof\nlol\n
 prop_checkPipeToNowhere5 = verifyNot checkPipeToNowhere "echo foo | xargs du"
 prop_checkPipeToNowhere6 = verifyNot checkPipeToNowhere "ls | echo $(cat)"
 prop_checkPipeToNowhere7 = verifyNot checkPipeToNowhere "echo foo | var=$(cat) ls"
-prop_checkPipeToNowhere8 = verify checkPipeToNowhere "foo | true"
 prop_checkPipeToNowhere9 = verifyNot checkPipeToNowhere "mv -i f . < /dev/stdin"
 prop_checkPipeToNowhere10 = verify checkPipeToNowhere "ls > file | grep foo"
 prop_checkPipeToNowhere11 = verify checkPipeToNowhere "ls | grep foo < file"
@@ -4684,6 +4694,7 @@ prop_checkSetESuppressed15 = verifyTree    checkSetESuppressed "set -e; f(){ :; 
 prop_checkSetESuppressed16 = verifyTree    checkSetESuppressed "set -e; f(){ :; }; until set -e; f; do :; done"
 prop_checkSetESuppressed17 = verifyNotTree checkSetESuppressed "set -e; f(){ :; }; g(){ :; }; g f"
 prop_checkSetESuppressed18 = verifyNotTree checkSetESuppressed "set -e; shopt -s inherit_errexit; f(){ :; }; x=$(f)"
+prop_checkSetESuppressed19 = verifyNotTree checkSetESuppressed "set -e; set -o posix; f(){ :; }; x=$(f)"
 checkSetESuppressed params t =
     if hasSetE params then runNodeAnalysis checkNode params t else []
   where
@@ -4761,8 +4772,12 @@ prop_checkExtraMaskedReturns32 = verifyNotTree checkExtraMaskedReturns "false < 
 prop_checkExtraMaskedReturns33 = verifyNotTree checkExtraMaskedReturns "{ false || true; } | true"
 prop_checkExtraMaskedReturns34 = verifyNotTree checkExtraMaskedReturns "{ false || :; } | true"
 prop_checkExtraMaskedReturns35 = verifyTree checkExtraMaskedReturns "f() { local -r x=$(false); }"
+prop_checkExtraMaskedReturns36 = verifyNotTree checkExtraMaskedReturns "time false"
+prop_checkExtraMaskedReturns37 = verifyNotTree checkExtraMaskedReturns "time $(time false)"
+prop_checkExtraMaskedReturns38 = verifyTree checkExtraMaskedReturns "x=$(time time time false) time $(time false)"
 
-checkExtraMaskedReturns params t = runNodeAnalysis findMaskingNodes params t
+checkExtraMaskedReturns params t =
+    runNodeAnalysis findMaskingNodes params (removeTransparentCommands t)
   where
     findMaskingNodes _ (T_Arithmetic _ list) = findMaskedNodesInList [list]
     findMaskingNodes _ (T_Array _ list) = findMaskedNodesInList $ allButLastSimpleCommands list
@@ -4795,6 +4810,13 @@ checkExtraMaskedReturns params t = runNodeAnalysis findMaskingNodes params t
       where
         simpleCommands = filter containsSimpleCommand cmds
 
+    removeTransparentCommands t =
+        doTransform go t
+      where
+        go cmd@(T_SimpleCommand id assigns (_:args)) | isTransparentCommand cmd
+          = T_SimpleCommand id assigns args
+        go t = t
+
     inform t = info (getId t) 2312 ("Consider invoking this command "
         ++ "separately to avoid masking its return value (or use '|| true' "
         ++ "to ignore).")
@@ -4826,6 +4848,10 @@ checkExtraMaskedReturns params t = runNodeAnalysis findMaskingNodes params t
             ,"set"
             ,"shopt"
             ]
+
+    isTransparentCommand t = fromMaybe False $ do
+        basename <- getCommandBasename t
+        return $ basename == "time"
 
     parentChildPairs t = go $ parents params t
       where
@@ -4980,6 +5006,43 @@ checkUnnecessaryParens params t =
             replaceStart id params 1 "", -- Remove "("
             replaceEnd id params 1 ""    -- Remove ")"
         ]
+
+
+prop_checkPlusEqualsNumber1 = verify checkPlusEqualsNumber "x+=1"
+prop_checkPlusEqualsNumber2 = verify checkPlusEqualsNumber "x+=42"
+prop_checkPlusEqualsNumber3 = verifyNot checkPlusEqualsNumber "(( x += 1 ))"
+prop_checkPlusEqualsNumber4 = verifyNot checkPlusEqualsNumber "declare -i x=0; x+=1"
+prop_checkPlusEqualsNumber5 = verifyNot checkPlusEqualsNumber "x+='1'"
+prop_checkPlusEqualsNumber6 = verifyNot checkPlusEqualsNumber "n=foo; x+=n"
+prop_checkPlusEqualsNumber7 = verify checkPlusEqualsNumber "n=4; x+=n"
+prop_checkPlusEqualsNumber8 = verify checkPlusEqualsNumber "n=4; x+=$n"
+prop_checkPlusEqualsNumber9 = verifyNot checkPlusEqualsNumber "declare -ia var; var[x]+=1"
+checkPlusEqualsNumber params t =
+    case t of
+        T_Assignment id Append var _ word -> sequence_ $ do
+            state <- CF.getIncomingState (cfgAnalysis params) id
+            guard $ isNumber state word
+            guard . not $ fromMaybe False $ CF.variableMayBeDeclaredInteger state var
+            return $ warn id 2324 "var+=1 will append, not increment. Use (( var += 1 )), declare -i var, or quote number to silence."
+        _ -> return ()
+
+  where
+    isNumber state word =
+        let
+            unquotedLiteral = getUnquotedLiteral word
+            isEmpty = unquotedLiteral == Just ""
+            isUnquotedNumber = not isEmpty && fromMaybe False (all isDigit <$> unquotedLiteral)
+            isNumericalVariableName = fromMaybe False $ do
+                str <- unquotedLiteral
+                CF.variableMayBeAssignedInteger state str
+            isNumericalVariableExpansion =
+                case word of
+                    T_NormalWord _ [part] -> fromMaybe False $ do
+                        str <- getUnmodifiedParameterExpansion part
+                        CF.variableMayBeAssignedInteger state str
+                    _ -> False
+        in
+            isUnquotedNumber || isNumericalVariableName || isNumericalVariableExpansion
 
 
 return []

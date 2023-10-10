@@ -1,5 +1,5 @@
 {-
-    Copyright 2012-2020 Vidar Holen
+    Copyright 2012-2022 Vidar Holen
 
     This file is part of ShellCheck.
     https://www.shellcheck.net
@@ -507,6 +507,15 @@ prop_rcCanSuppressEarlyProblems2 = null result
     result = checkWithRc "disable=1104" emptyCheckSpec {
         csScript = "!/bin/bash\necho 'hello world'"
     }
+
+prop_sourceWithHereDocWorks = null result
+  where
+    result = checkWithIncludes [("bar", "true\n")] "source bar << eof\nlol\neof"
+
+prop_hereDocsAreParsedWithoutTrailingLinefeed = 1044 `elem` result
+  where
+    result = check "cat << eof"
+
 
 return []
 runTests = $quickCheckAll

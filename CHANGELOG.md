@@ -1,5 +1,17 @@
 ## Git
 ### Added
+- SC2324: Warn when x+=1 appends instead of increments
+- SC2325: Warn about multiple `!`s in dash/sh.
+- SC2326: Warn about `foo | ! bar` in bash/dash/sh.
+
+### Fixed
+- source statements with here docs now work correctly
+
+### Changed
+
+
+## v0.9.0 - 2022-12-12
+### Added
 - SC2316: Warn about 'local readonly foo' and similar (thanks, patrickxia!)
 - SC2317: Warn about unreachable commands
 - SC2318: Warn about backreferences in 'declare x=1 y=$x'

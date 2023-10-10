@@ -60,6 +60,8 @@ checks = [
     ,checkBraceExpansionVars
     ,checkMultiDimensionalArrays
     ,checkPS1Assignments
+    ,checkMultipleBangs
+    ,checkBangAfterPipe
     ]
 
 testChecker (ForShell _ t) =
@@ -184,6 +186,11 @@ prop_checkBashisms96 = verifyNot checkBashisms "#!/bin/dash\necho $_"
 prop_checkBashisms97 = verify checkBashisms "#!/bin/sh\necho ${var,}"
 prop_checkBashisms98 = verify checkBashisms "#!/bin/sh\necho ${var^^}"
 prop_checkBashisms99 = verify checkBashisms "#!/bin/dash\necho [^f]oo"
+prop_checkBashisms100 = verify checkBashisms "read -r"
+prop_checkBashisms101 = verify checkBashisms "read"
+prop_checkBashisms102 = verifyNot checkBashisms "read -r foo"
+prop_checkBashisms103 = verifyNot checkBashisms "read foo"
+prop_checkBashisms104 = verifyNot checkBashisms "read ''"
 checkBashisms = ForShell [Sh, Dash] $ \t -> do
     params <- ask
     kludge params t
@@ -379,6 +386,9 @@ checkBashisms = ForShell [Sh, Dash] $ \t -> do
                 let literal = onlyLiteralString format
                 guard $ "%q" `isInfixOf` literal
                 return $ warnMsg (getId format) 3050 "printf %q is"
+
+            when (name == "read" && all isFlag rest) $
+                warnMsg (getId cmd) 3061 "read without a variable is"
       where
         unsupportedCommands = [
             "let", "caller", "builtin", "complete", "compgen", "declare", "dirs", "disown",
@@ -557,6 +567,30 @@ checkPS1Assignments = ForShell [Bash] f
     enclosedRegex = mkRegex "\\\\\\[.*\\\\\\]" -- FIXME: shouldn't be eager
     escapeRegex = mkRegex "\\\\x1[Bb]|\\\\e|\x1B|\\\\033"
 
+
+prop_checkMultipleBangs1 = verify checkMultipleBangs "! ! true"
+prop_checkMultipleBangs2 = verifyNot checkMultipleBangs "! true"
+checkMultipleBangs = ForShell [Dash, Sh] f
+  where
+    f token = case token of
+        T_Banged id (T_Banged _ _) ->
+            err id 2325 "Multiple ! in front of pipelines are a bash/ksh extension. Use only 0 or 1."
+        _ -> return ()
+
+
+prop_checkBangAfterPipe1 = verify checkBangAfterPipe "true | ! true"
+prop_checkBangAfterPipe2 = verifyNot checkBangAfterPipe "true | ( ! true )"
+prop_checkBangAfterPipe3 = verifyNot checkBangAfterPipe "! ! true | true"
+checkBangAfterPipe = ForShell [Dash, Sh, Bash] f
+  where
+    f token = case token of
+        T_Pipeline _ _ cmds -> mapM_ check cmds
+        _ -> return ()
+
+    check token = case token of
+        T_Banged id _ ->
+            err id 2326 "! is not allowed in the middle of pipelines. Use command group as in cmd | { ! cmd; } if necessary."
+        _ -> return ()
 
 return []
 runTests =  $( [| $(forAllProperties) (quickCheckWithResult (stdArgs { maxSuccess = 1 }) ) |])

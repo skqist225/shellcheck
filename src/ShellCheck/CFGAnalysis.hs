@@ -20,6 +20,7 @@
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE DeriveAnyClass, DeriveGeneric #-}
+{-# LANGUAGE CPP #-}
 
 {-
     Data Flow Analysis on a Control Flow Graph.
@@ -58,6 +59,8 @@ module ShellCheck.CFGAnalysis (
     ,getIncomingState
     ,getOutgoingState
     ,doesPostDominate
+    ,variableMayBeDeclaredInteger
+    ,variableMayBeAssignedInteger
     ,ShellCheck.CFGAnalysis.runTests -- STRIP
     ) where
 
@@ -151,6 +154,20 @@ doesPostDominate analysis target base = fromMaybe False $ do
     (_, baseEnd) <- M.lookup base $ tokenToRange analysis
     (targetStart, _) <- M.lookup target $ tokenToRange analysis
     return $ targetStart `elem` (postDominators analysis ! baseEnd)
+
+-- See if any execution path results in the variable containing a state
+variableMayHaveState :: ProgramState -> String -> CFVariableProp -> Maybe Bool
+variableMayHaveState state var property = do
+    value <- M.lookup var $ variablesInScope state
+    return $ any (S.member property) $ variableProperties value
+
+-- See if any execution path declares the variable an integer (declare -i).
+variableMayBeDeclaredInteger state var = variableMayHaveState state var CFVPInteger
+
+-- See if any execution path suggests the variable may contain an integer value
+variableMayBeAssignedInteger state var = do
+    value <- M.lookup var $ variablesInScope state
+    return $ (numericalStatus $ variableValue value) >= NumericalStatusMaybe
 
 getDataForNode analysis node = M.lookup node $ nodeToData analysis
 
@@ -433,6 +450,13 @@ data StackEntry s = StackEntry {
 }
     deriving (Eq, Generic, NFData)
 
+#if MIN_VERSION_deepseq(1,4,2)
+-- Our deepseq already has a STRef instance
+#else
+-- Older deepseq (for GHC < 8) lacks this instance
+instance NFData (STRef s a) where
+    rnf = (`seq` ())
+#endif
 
 -- Overwrite a base state with the contents of a diff state
 -- This is unrelated to join/merge.
@@ -1300,8 +1324,7 @@ dataflow ctx entry = do
         outgoing = map snd outgoingL
         isRegular = ((== CFEFlow) . fst)
 
-runRoot ctx entry exit = do
-    let env = createEnvironmentState
+runRoot ctx env entry exit = do
     writeSTRef (cInput ctx) $ env
     writeSTRef (cOutput ctx) $ env
     writeSTRef (cNode ctx) $ entry
@@ -1321,9 +1344,10 @@ analyzeControlFlow params t =
         runST $ f cfg entry exit
   where
     f cfg entry exit = do
+        let env = createEnvironmentState
         ctx <- newCtx $ cfGraph cfg
         -- Do a dataflow analysis starting on the root node
-        exitState <- runRoot ctx entry exit
+        exitState <- runRoot ctx env entry exit
 
         -- All nodes we've touched
         invocations <- readSTRef $ cInvocations ctx
@@ -1336,7 +1360,7 @@ analyzeControlFlow params t =
         let uninvoked = M.difference declaredFunctions invokedNodes
 
         let stragglerInput =
-                exitState {
+                (env `patchState` exitState) {
                     -- We don't want `die() { exit $?; }; echo "Sourced"` to assume $? is always echo
                     sExitCodes = Nothing
                 }
@@ -1391,7 +1415,7 @@ analyzeControlFlow params t =
     getFunctionTargets :: InternalState -> M.Map Node FunctionDefinition
     getFunctionTargets state =
         let
-            declaredFuncs = S.unions $ mapStorage $ sFunctionTargets state
+            declaredFuncs = S.unions $ M.elems $ mapStorage $ sFunctionTargets state
             getFunc d =
                 case d of
                     FunctionDefinition _ entry _ -> Just (entry, d)
